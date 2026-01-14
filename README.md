@@ -1,5 +1,5 @@
 
-# Network Automation Utilities — Cisco Access‑Port Audit ➜ Excel
+# Network Automation Utilities — Cisco Access Switch Audit ➜ Excel
 
 A modular Python utility that connects to Cisco switches (optionally through an SSH jump host),
 collects interface details, PoE information, and neighbor presence, then exports a clean,
