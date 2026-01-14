@@ -14,7 +14,6 @@ Key features:
 - Outputs Excel with auto-sizing columns and conditional formatting
 - Multi-threaded worker pool with progress bar feedback
 """
-
 from __future__ import annotations
 import argparse
 import concurrent.futures as cf
