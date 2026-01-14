@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cisco Access-Port Audit -> Excel
+Cisco Access Switch Audit -> Excel
 
 This script connects to Cisco access switches (optionally via a jump host),
 collects interface and PoE/neighbor information, and produces a formatted
@@ -882,7 +882,7 @@ def main():
     - Runs audit concurrently with progress
     - Writes SUMMARY + per-device sheets to Excel
     """
-    parser = argparse.ArgumentParser(description="Cisco Access-Port Audit -> Excel (TextFSM 'show interfaces')")
+    parser = argparse.ArgumentParser(description="Cisco Access Switch Audit -> Excel (TextFSM 'show interfaces')")
     parser.add_argument("--direct", action="store_true", help="Connect directly (no jump host)")
     parser.add_argument("--stale-days", type=int, default=30, help="Days to consider 'stale' for access ports (0 to disable).")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
