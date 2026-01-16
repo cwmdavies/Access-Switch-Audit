@@ -837,9 +837,15 @@ def _audit_connected_device(
             except Exception:
                 crc_err = 0
 
-            # Last input time
+
+            # Last input / output times
             last_input_raw = r.get('last_input', '') or r.get('last_input_text', '') or ''
             last_input_secs = _parse_last_input_seconds(last_input_raw) if last_input_raw else None
+
+            last_output_raw = r.get('last_output', '') or r.get('last_output_text', '') or ''
+            # We don't currently use last_output_secs for any logic, but keep it for parity/debugging.
+            last_output_secs = _parse_last_input_seconds(last_output_raw) if last_output_raw else None
+
 
             # PoE lookup using aliases (short/long/raw)
             poe = {}
@@ -885,6 +891,7 @@ def _audit_connected_device(
                 'Output Errors': out_err,
                 'CRC Errors': crc_err,
                 'Last Input': last_input_raw,
+                'Last Output': last_output_raw,
                 'PoE Power (W)': poe.get('poe_power_w', ''),
                 'PoE Oper': poe.get('poe_oper', ''),
                 'PoE Admin': poe.get('poe_admin', ''),
