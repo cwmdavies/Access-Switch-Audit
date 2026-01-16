@@ -431,6 +431,28 @@ def _get_cdp_neighbors(conn) -> Dict[str, Tuple[str, str]]:
     return neighbors
 
 
+def _parse_ios_version(show_ver_text: str) -> str:
+    """
+    Extract a concise OS version string from 'show version' output.
+    Tries common IOS/IOS-XE patterns; falls back to the first 'Version x.y...' hit.
+    Returns short text like 'IOS-XE 17.6.5a' or 'IOS 15.2(7)E8' if found, else ''.
+    """
+    s = show_ver_text or ""
+    # Common IOS-XE banner: 'Cisco IOS XE Software, Version 17.6.5a'
+    m = re.search(r"Cisco IOS XE Software,\s*Version\s*([^\s,]+)", s, flags=re.I)
+    if m:
+        return f"IOS-XE {m.group(1)}"
+    # Common IOS banner: 'Cisco IOS Software, ... Version 15.2(7)E8'
+    m = re.search(r"Cisco IOS Software.*Version\s*([^\s,]+)", s, flags=re.I)
+    if m:
+        return f"IOS {m.group(1)}"
+    # NX-OS/others pattern (just in case): 'system:    version 9.3(10)'
+    m = re.search(r"\bversion\s+([0-9][^ \r\n\t,;)]*)", s, flags=re.I)
+    if m:
+        return m.group(1)
+    return ""
+
+
 # ---------------- 'show interfaces status' robust parser (fallback) ----------------
 def _find_columns(header_line: str) -> Dict[str, slice]:
     """
@@ -640,6 +662,7 @@ def audit_device(ip: str,
         return ip, hostname, [], {
             'Device': hostname or ip,
             'Mgmt IP': ip,
+            'IOS Version': '',
             'Total Ports (phy)': 'ERROR',
             'Access Ports': '',
             'Connected': '',
@@ -700,6 +723,13 @@ def _audit_connected_device(
         except Exception as e:
             if debug:
                 print(f"[{hostname or ip}] enable failed: {e}")
+
+    ios_version = ""
+    try:
+        out_ver = conn.send_command("show version", read_timeout=60, use_textfsm=False)
+        ios_version = _parse_ios_version(out_ver)
+    except Exception:
+        ios_version = ""
 
     # --- Primary interface records via TextFSM
     tfsm_records = get_interfaces_via_show_interfaces(conn)
@@ -874,6 +904,7 @@ def _audit_connected_device(
         summary = {
             'Device': hostname or ip,
             'Mgmt IP': ip,
+            'IOS Version': ios_version,
             'Total Ports (phy)': 0,
             'Access Ports': 0,
             'Trunk Ports': 0,
@@ -901,6 +932,7 @@ def _audit_connected_device(
         summary = {
             'Device': hostname or ip,
             'Mgmt IP': ip,
+            'IOS Version': ios_version,
             'Total Ports (phy)': total,
             'Access Ports': access_cnt,
             'Trunk Ports': trunk_cnt,
