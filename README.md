@@ -290,7 +290,7 @@ Disconnected ports require **both** no PoE draw and no LLDP/CDP neighbor to be f
 ---
 
 ## 📝 License
-MIT License
+GNU General Public License v3.0
 
 ## 👤 Author
 Christopher Davies
