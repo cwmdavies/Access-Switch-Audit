@@ -255,6 +255,8 @@ def _format_worksheet(ws, df: pd.DataFrame) -> None:
                 CellIsRule(operator="equal", formula=['"err-disabled"'], fill=red_fill))
             ws.conditional_formatting.add(rng,
                 CellIsRule(operator="equal", formula=['"administratively down"'], fill=grey_fill))
+            ws.conditional_formatting.add(rng,
+                CellIsRule(operator="equal", formula=['"disabled"'], fill=grey_fill))
 
         elif "errors" in header:  # Input/Output/CRC Errors
             ws.conditional_formatting.add(rng,
@@ -736,6 +738,7 @@ def _audit_connected_device(
     detailed: List[Dict[str, Any]] = []
 
     # --- NEW: Build a per-interface mode/VLAN map from 'show interfaces status'
+    
     sif_status_map: Dict[str, Dict[str, str]] = {}
     try:
         out_status = conn.send_command("show interfaces status", read_timeout=60, use_textfsm=False)
@@ -745,7 +748,9 @@ def _audit_connected_device(
             if not port_norm:
                 continue
 
-            vlan_raw = (rec.get('vlan') or '').strip().lower()
+            vlan_raw   = (rec.get('vlan')   or '').strip().lower()
+            status_raw = (rec.get('status') or '').strip().lower()
+
             if vlan_raw in {'trunk', 'rspan'}:
                 mode = 'trunk'
                 vlan = vlan_raw
@@ -758,7 +763,8 @@ def _audit_connected_device(
                 mode = 'access'
                 vlan = vlan_raw
 
-            sif_status_map[port_norm] = {'mode': mode, 'vlan': vlan}
+            # Stash status so we can override the final Status if present
+            sif_status_map[port_norm] = {'mode': mode, 'vlan': vlan, 'status': status_raw}
     except Exception:
         # If we can't parse/show interfaces status, we'll fall back to the prior behavior
         sif_status_map = {}
@@ -782,14 +788,23 @@ def _audit_connected_device(
 
             description = r.get('description', '')
 
+            
             # --- Normalize operational/admin/protocol state into a canonical Status
-            line_state = (r.get('link_status') or r.get('status') or '').lower()
-            admin_state = (r.get('admin_state') or '').lower()
-            proto_state = (r.get('protocol') or r.get('protocol_status') or '').lower()
+            line_state  = (r.get('link_status') or r.get('status') or '').strip().lower().replace('_', '-')
+            admin_state = (r.get('admin_state') or '').strip().lower().replace('_', '-')
+            proto_state = (r.get('protocol') or r.get('protocol_status') or '').strip().lower().replace('_', '-')
 
-            if admin_state == "administratively down":
+            def _canon(s: str) -> str:
+                return ' '.join(s.split())
+
+            line_state  = _canon(line_state)
+            admin_state = _canon(admin_state)
+            proto_state = _canon(proto_state)
+
+            # Base status from detailed ('show interfaces') fields
+            if "administratively down" in (line_state, admin_state, proto_state):
                 status = "administratively down"
-            elif line_state == "err-disabled":
+            elif "err-disabled" in (line_state, admin_state, proto_state) or "errdisabled" in (line_state, admin_state, proto_state):
                 status = "err-disabled"
             elif line_state == "up" and proto_state == "up":
                 status = "connected"
@@ -801,6 +816,23 @@ def _audit_connected_device(
                 status = "notconnect"
             else:
                 status = "unknown"
+
+            _ovr = None
+            if short_port in sif_status_map:
+                _ovr = (sif_status_map[short_port].get('status') or '').strip().lower()
+            else:
+                for alias in all_aliases(short_port):
+                    if alias in sif_status_map:
+                        _ovr = (sif_status_map[alias].get('status') or '').strip().lower()
+                        break
+
+            if _ovr:
+                # Normalize common variants to canonical values
+                if _ovr in {"errdisabled"}:
+                    _ovr = "err-disabled"
+                # Accept typical table statuses as-is
+                if _ovr in {"connected", "notconnect", "administratively down", "err-disabled", "inactive", "monitoring"}:
+                    status = _ovr
 
             # OLD values (kept as fallback if 'show interfaces status' is unavailable)
             vlan = (r.get('vlan') or '').lower()
@@ -902,11 +934,6 @@ def _audit_connected_device(
     # --- Build summary
     df = pd.DataFrame(detailed)
 
-    
-    def _pct(n: int, d: int) -> float:
-        return round((n / d * 100.0), 1) if d else 0.0
-
-
     if df.empty:
         summary = {
             'Device': hostname or ip,
@@ -935,7 +962,10 @@ def _audit_connected_device(
         notconnect_cnt  = int((df['Status'] == 'notconnect').sum())
         admindown_cnt   = int((df['Status'] == 'administratively down').sum())
         errdisabled_cnt = int((df['Status'] == 'err-disabled').sum())
-
+    
+        def _pct(n: int, d: int) -> float:
+            return round((n / d * 100.0), 1) if d else 0.0
+        
         summary = {
             'Device': hostname or ip,
             'Mgmt IP': ip,
@@ -952,6 +982,7 @@ def _audit_connected_device(
             '% Trunk of Total': _pct(trunk_cnt, total),
             '% Routed of Total': _pct(routed_cnt, total),
             '% Connected of Total': _pct(connected_cnt, total),
+            '% AdminDown of Total': _pct(admindown_cnt, total),
         }
 
     return ip, hostname, detailed, summary
