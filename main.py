@@ -111,12 +111,29 @@ from openpyxl.styles import PatternFill
 # ---- external imports ----
 from Modules.credentials import get_secret_with_fallback, get_enable_secret
 from Modules.jump_manager import JumpManager
-from Modules.config import JUMP_HOST
+from Modules.config import (
+    JUMP_HOST,
+    CONNECTION_TIMEOUT,
+    BANNER_TIMEOUT,
+    READ_TIMEOUT,
+    RETRY_ATTEMPTS,
+    RETRY_BASE_WAIT,
+    DEFAULT_STALE_DAYS,
+    DEFAULT_WORKERS,
+    ERROR_COUNTER_THRESHOLD,
+    MIN_EXCEL_COLUMN_WIDTH,
+    MAX_EXCEL_COLUMN_WIDTH,
+    ENABLE_PORT_CATEGORIZATION,
+    DEFAULT_OUTPUT_FORMAT,
+)
 from Modules.netmiko_utils import connect_to_device
+import socket
+import datetime
+import json
 
-# ---------------- Configuration ----------------
-MIN_WIDTH = 8   # Minimum Excel column width
-MAX_WIDTH = 60  # Maximum Excel column width
+# Use config values
+MIN_WIDTH = MIN_EXCEL_COLUMN_WIDTH
+MAX_WIDTH = MAX_EXCEL_COLUMN_WIDTH
 
 
 # ---------------- Helpers ----------------
@@ -455,6 +472,132 @@ def _parse_ios_version(show_ver_text: str) -> str:
     return ""
 
 
+def _parse_hardware_from_version(show_ver_text: str) -> Dict[str, str]:
+    """
+    Extract hardware details (model, serial, memory) from 'show version' output.
+    Attempts TextFSM parsing first, falls back to regex patterns if needed.
+    
+    Args:
+        show_ver_text: Raw output from 'show version' command.
+    
+    Returns:
+        Dict with keys: model, serial, memory (all strings, empty if not found).
+    """
+    data = {'model': '', 'serial': '', 'memory': ''}
+    s = show_ver_text or ""
+    
+    # ===== TEXTFSM PARSING ATTEMPT =====
+    try:
+        from netmiko.utilities import get_template_file
+        import textfsm
+        
+        template_path = None
+        try:
+            template_path = get_template_file('cisco_ios', 'show_version')
+        except Exception:
+            pass
+        
+        if template_path:
+            try:
+                with open(template_path, 'r') as f:
+                    fsm = textfsm.TextFSM(f)
+                    result = fsm.ParseText(s)
+                    if result:
+                        headers = fsm.header
+                        first_row = result[0]
+                        parsed = dict(zip(headers, first_row))
+                        
+                        # TextFSM field names vary by device; try common variations
+                        # Check ALL available fields and attempt extraction
+                        if not data['model']:
+                            for key in parsed.keys():
+                                if 'model' in key.lower() and parsed[key]:
+                                    data['model'] = parsed[key].strip()
+                                    break
+                        
+                        if not data['serial']:
+                            for key in parsed.keys():
+                                if any(term in key.lower() for term in ['serial', 'chassis_serial']):
+                                    if parsed[key]:
+                                        data['serial'] = parsed[key].strip()
+                                        break
+                        
+                        if not data['memory']:
+                            for key in parsed.keys():
+                                if 'memory' in key.lower() and parsed[key]:
+                                    mem_str = parsed[key].strip()
+                                    if mem_str and not any(u in mem_str for u in ['B', 'K', 'M', 'G']):
+                                        data['memory'] = f"{mem_str} B"
+                                    else:
+                                        data['memory'] = mem_str
+                                    break
+                        
+                        # If TextFSM succeeded in finding at least one field, return
+                        if data['model'] or data['serial'] or data['memory']:
+                            return data
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    
+    # ===== REGEX FALLBACK PATTERNS =====
+    
+    # Model patterns (try multiple patterns for different device families)
+    # Order matters - check specific patterns first, then generic ones
+    model_patterns = [
+        r"^Model number\s*:\s*([A-Z0-9\-]+)",  # Exact match for "Model number" line (C9200-24P or WS-C2960X-24PS-L)
+        r"cisco\s+([A-Z][A-Z0-9\-]*(?:-[A-Z0-9]+)*)\s*\(",  # cisco WS-C2960X-24PS-L ( format
+        r"Switch Ports Model\s+SW.*\n.*?\*\s+\d+\s+\d+\s+(\S+)",  # From switch info table
+    ]
+    
+    for pattern in model_patterns:
+        m = re.search(pattern, s, flags=re.MULTILINE | re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            # Filter out non-model strings
+            if candidate and not any(x in candidate.lower() for x in ['bytes', 'software', 'flash', 'version']):
+                # Reject short codes like C0, R0, B0, E0 unless they're part of a larger model number
+                if len(candidate) > 2 or '-' in candidate:
+                    data['model'] = candidate
+                    break
+    
+    # Serial patterns
+    serial_patterns = [
+        r"^System [Ss]erial [Nn]umber\s*:\s*(\S+)",  # System Serial Number (most reliable)
+        r"^Processor board ID\s*:\s*(\S+)",  # Processor board ID (backup)
+        r"^Motherboard [Ss]erial [Nn]umber\s*:\s*(\S+)",  # Motherboard Serial
+    ]
+    
+    for pattern in serial_patterns:
+        m = re.search(pattern, s, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            data['serial'] = m.group(1).strip()
+            break
+    
+    # Memory patterns (extract just the size)
+    # Look for specific lines with memory information
+    memory_patterns = [
+        r"^cisco\s+\S+\s+(?:\([^)]+\)\s+)?.*?with\s+(\d+)K\s+bytes",  # "cisco WS-C2960X-24PS-L (APM86XXX) processor (revision R0) with 524288K bytes of memory"
+        r"(\d+)K\s+bytes\s+of\s+physical\s+memory",  # "4011284K bytes of physical memory"
+        r"(\d+)K\s+bytes\s+of\s+memory",  # Generic "524288K bytes of memory"
+    ]
+    
+    for pattern in memory_patterns:
+        m = re.search(pattern, s, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            mem_kb = int(m.group(1).strip())
+            # Convert KB to MB
+            mem_mb = mem_kb / 1024
+            # Format with 1 decimal place if not a whole number, otherwise as integer
+            if mem_mb == int(mem_mb):
+                data['memory'] = f"{int(mem_mb)} MB"
+            else:
+                data['memory'] = f"{mem_mb:.1f} MB"
+            break
+    
+    return data
+
+
 # ---------------- 'show interfaces status' robust parser (fallback) ----------------
 def _find_columns(header_line: str) -> Dict[str, slice]:
     """
@@ -541,6 +684,36 @@ def parse_show_interfaces_status(output: str) -> List[Dict[str, str]]:
             i += 1
 
     return records
+
+
+def _categorize_port(row: Dict[str, Any], stale_days: int) -> str:
+    """
+    Classify an access port for quick inventory analysis.
+    
+    Returns:
+        Category string: 'trunk/routed', 'disabled', 'error', 'stale-unused',
+                       'powered-device', 'connected', or 'available'.
+    """
+    status = (row.get('Status', '') or '').lower()
+    mode = (row.get('Mode', '') or '').lower()
+    
+    if mode != 'access':
+        return 'trunk/routed'
+    if status == 'administratively down':
+        return 'disabled'
+    if status == 'err-disabled':
+        return 'error'
+    if row.get(f'Stale (≥{stale_days} d)', False):
+        return 'stale-unused'
+    if status == 'connected':
+        poe_w = (row.get('PoE Power (W)', '') or '').strip()
+        try:
+            if float(poe_w.split()[0]) > 0:
+                return 'powered-device'
+        except (ValueError, IndexError):
+            pass
+        return 'connected'
+    return 'available'
 
 
 def parse_show_power_inline(output: str) -> Dict[str, Dict[str, Any]]:
@@ -637,9 +810,9 @@ def audit_device(ip: str,
                  stale_days: int,
                  debug: bool = False) -> Tuple[str, str | None, List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Connect to a single device and perform audit.
+    Connect to a single device and perform audit with exponential backoff retry.
 
-    - Establishes SSH session (direct or via jump host)
+    - Establishes SSH session (direct or via jump host) with retry logic
     - Collects interface data using TextFSM
     - Enriches with PoE, LLDP/CDP neighbors
     - Computes stale flags and error counters
@@ -651,34 +824,53 @@ def audit_device(ip: str,
     jump = JumpManager(jump_host, username, password) if jump_host else None
     conn = None
     hostname: str | None = None
-    try:
-        if jump:
-            with jump:
-                conn = connect_to_device(ip, username, password, jump=jump)
-                return _audit_connected_device(conn, ip, enable_secret, stale_days, debug)
-        else:
-            conn = connect_to_device(ip, username, password)
-            return _audit_connected_device(conn, ip, enable_secret, stale_days, debug)
-
-    except Exception as e:
-        return ip, hostname, [], {
-            'Device': hostname or ip,
-            'Mgmt IP': ip,
-            'IOS Version': '',
-            'Total Ports (phy)': 'ERROR',
-            'Access Ports': '',
-            'Connected': '',
-            'Not Connected': '',
-            'Admin Down': '',
-            'Err-Disabled': '',
-            'Error': str(e),
-        }
-    finally:
+    
+    # Retry loop with exponential backoff
+    last_error = None
+    for attempt in range(RETRY_ATTEMPTS):
         try:
-            if conn:
-                conn.disconnect()
-        except Exception:
-            pass
+            if jump:
+                with jump:
+                    conn = connect_to_device(ip, username, password, jump=jump)
+                    return _audit_connected_device(conn, ip, enable_secret, stale_days, debug)
+            else:
+                conn = connect_to_device(ip, username, password)
+                return _audit_connected_device(conn, ip, enable_secret, stale_days, debug)
+        except Exception as e:
+            last_error = e
+            if attempt < RETRY_ATTEMPTS - 1:
+                wait_time = RETRY_BASE_WAIT ** (attempt + 1)
+                if debug:
+                    print(f"[{ip}] Attempt {attempt+1}/{RETRY_ATTEMPTS} failed: {str(e)[:50]}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                if debug:
+                    print(f"[{ip}] All {RETRY_ATTEMPTS} attempts failed.")
+        finally:
+            try:
+                if conn:
+                    conn.disconnect()
+            except Exception:
+                pass
+    
+    # All retries exhausted
+    return ip, hostname, [], {
+        'Device': hostname or ip,
+        'Mgmt IP': ip,
+        'Model': '',
+        'Serial': '',
+        'Memory': '',
+        'IOS Version': '',
+        'Total Ports (phy)': 'ERROR',
+        'Access Ports': '',
+        'Trunk Ports': '',
+        'Routed Ports': '',
+        'Connected': '',
+        'Not Connected': '',
+        'Admin Down': '',
+        'Err-Disabled': '',
+        'Error': str(last_error),
+    }
 
 
 def _audit_connected_device(
@@ -726,12 +918,15 @@ def _audit_connected_device(
             if debug:
                 print(f"[{hostname or ip}] enable failed: {e}")
 
+    # --- Get version and hardware info (single command)
     ios_version = ""
+    hardware = {'model': '', 'serial': '', 'memory': ''}
     try:
         out_ver = conn.send_command("show version", read_timeout=60, use_textfsm=False)
         ios_version = _parse_ios_version(out_ver)
+        hardware = _parse_hardware_from_version(out_ver)
     except Exception:
-        ios_version = ""
+        pass
 
     # --- Primary interface records via TextFSM
     tfsm_records = get_interfaces_via_show_interfaces(conn)
@@ -905,7 +1100,7 @@ def _audit_connected_device(
                 else:
                     stale_flag = (not poe_active) and (not has_neighbor)
 
-            detailed.append({
+            record = {
                 'Device': hostname or ip,
                 'Mgmt IP': ip,
                 'Interface': long_port,
@@ -929,7 +1124,13 @@ def _audit_connected_device(
                 'PoE Admin': poe.get('poe_admin', ''),
                 'LLDP/ CDP Neighbor': has_neighbor,
                 f'Stale (≥{stale_days} d)': stale_flag,
-            })
+            }
+            
+            # Add port category if enabled
+            if ENABLE_PORT_CATEGORIZATION:
+                record['Port Category'] = _categorize_port(record, stale_days)
+            
+            detailed.append(record)
 
     # --- Build summary
     df = pd.DataFrame(detailed)
@@ -938,7 +1139,10 @@ def _audit_connected_device(
         summary = {
             'Device': hostname or ip,
             'Mgmt IP': ip,
+            'Model': hardware.get('model', ''),
             'IOS Version': ios_version,
+            'Serial': hardware.get('serial', ''),
+            'Memory': hardware.get('memory', ''),
             'Total Ports (phy)': 0,
             'Access Ports': 0,
             'Trunk Ports': 0,
@@ -969,7 +1173,10 @@ def _audit_connected_device(
         summary = {
             'Device': hostname or ip,
             'Mgmt IP': ip,
+            'Model': hardware.get('model', ''),
             'IOS Version': ios_version,
+            'Serial': hardware.get('serial', ''),
+            'Memory': hardware.get('memory', ''),
             'Total Ports (phy)': total,
             'Access Ports': access_cnt,
             'Trunk Ports': trunk_cnt,
@@ -989,7 +1196,7 @@ def _audit_connected_device(
 
 
 # ---------------- Progress bar (event-driven with final drain) ----------------
-def _print_progress_extended(started: int, done: int, total: int, width: int = 30) -> None:
+def _print_progress_extended(started: int, done: int, total: int, current_ip: str = "", width: int = 30) -> None:
     """
     Render a simple, event-driven progress bar (non-thread-safe write).
 
@@ -997,12 +1204,14 @@ def _print_progress_extended(started: int, done: int, total: int, width: int = 3
         started: Number of jobs that have started
         done: Number of jobs completed
         total: Total jobs
+        current_ip: Currently processing device (optional)
         width: Bar width in characters
     """
     ratio = 0 if total == 0 else done / total
     filled = int(ratio * width)
     bar = "█" * filled + "░" * (width - filled)
-    sys.stdout.write(f"\rProgress: [{bar}] {done}/{total}  |  started: {started}/{total}")
+    current_str = f" | Current: {current_ip[:30]}" if current_ip else ""
+    sys.stdout.write(f"\rProgress: [{bar}] {done}/{total}  |  started: {started}/{total}{current_str}")
     sys.stdout.flush()
     if done == total:
         sys.stdout.write("\n")
