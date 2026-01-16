@@ -574,27 +574,6 @@ def _parse_hardware_from_version(show_ver_text: str) -> Dict[str, str]:
             data['serial'] = m.group(1).strip()
             break
     
-    # Memory patterns (extract just the size)
-    # Look for specific lines with memory information
-    memory_patterns = [
-        r"^cisco\s+\S+\s+(?:\([^)]+\)\s+)?.*?with\s+(\d+)K\s+bytes",  # "cisco WS-C2960X-24PS-L (APM86XXX) processor (revision R0) with 524288K bytes of memory"
-        r"(\d+)K\s+bytes\s+of\s+physical\s+memory",  # "4011284K bytes of physical memory"
-        r"(\d+)K\s+bytes\s+of\s+memory",  # Generic "524288K bytes of memory"
-    ]
-    
-    for pattern in memory_patterns:
-        m = re.search(pattern, s, flags=re.IGNORECASE | re.MULTILINE)
-        if m:
-            mem_kb = int(m.group(1).strip())
-            # Convert KB to MB
-            mem_mb = mem_kb / 1024
-            # Format with 1 decimal place if not a whole number, otherwise as integer
-            if mem_mb == int(mem_mb):
-                data['memory'] = f"{int(mem_mb)} MB"
-            else:
-                data['memory'] = f"{mem_mb:.1f} MB"
-            break
-    
     return data
 
 
@@ -1142,7 +1121,6 @@ def _audit_connected_device(
             'Model': hardware.get('model', ''),
             'IOS Version': ios_version,
             'Serial': hardware.get('serial', ''),
-            'Memory': hardware.get('memory', ''),
             'Total Ports (phy)': 0,
             'Access Ports': 0,
             'Trunk Ports': 0,
@@ -1176,7 +1154,6 @@ def _audit_connected_device(
             'Model': hardware.get('model', ''),
             'IOS Version': ios_version,
             'Serial': hardware.get('serial', ''),
-            'Memory': hardware.get('memory', ''),
             'Total Ports (phy)': total,
             'Access Ports': access_cnt,
             'Trunk Ports': trunk_cnt,
